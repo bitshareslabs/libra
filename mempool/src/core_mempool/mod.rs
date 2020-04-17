@@ -6,11 +6,4 @@ mod mempool;
 mod transaction;
 mod transaction_store;
 
-pub use self::{
-    index::TxnPointer,
-    mempool::Mempool as CoreMempool,
-    transaction::{MempoolAddTransactionStatus, TimelineState},
-};
-
-#[cfg(test)]
-mod unit_tests;
+pub use self::{index::TxnPointer, mempool::Mempool as CoreMempool, transaction::TimelineState};

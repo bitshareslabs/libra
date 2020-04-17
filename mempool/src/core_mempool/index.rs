@@ -3,6 +3,7 @@
 
 /// This module provides various indexes used by Mempool
 use crate::core_mempool::transaction::{MempoolTransaction, TimelineState};
+use libra_types::account_address::AccountAddress;
 use std::{
     cmp::Ordering,
     collections::{btree_set::Iter, BTreeMap, BTreeSet},
@@ -10,7 +11,6 @@ use std::{
     ops::Bound,
     time::Duration,
 };
-use types::account_address::AccountAddress;
 
 pub type AccountTransactions = BTreeMap<u64, MempoolTransaction>;
 
@@ -49,7 +49,7 @@ impl PriorityIndex {
 
     fn make_key(&self, txn: &MempoolTransaction) -> OrderedQueueKey {
         OrderedQueueKey {
-            gas_price: txn.get_gas_price(),
+            gas_ranking_score: txn.ranking_score,
             expiration_time: txn.expiration_time,
             address: txn.get_sender(),
             sequence_number: txn.get_sequence_number(),
@@ -60,11 +60,15 @@ impl PriorityIndex {
     pub(crate) fn iter(&self) -> PriorityQueueIter {
         self.data.iter().rev()
     }
+
+    pub(crate) fn size(&self) -> usize {
+        self.data.len()
+    }
 }
 
 #[derive(Eq, PartialEq, Clone, Debug, Hash)]
 pub struct OrderedQueueKey {
-    pub gas_price: u64,
+    pub gas_ranking_score: u64,
     pub expiration_time: Duration,
     pub address: AccountAddress,
     pub sequence_number: u64,
@@ -78,7 +82,7 @@ impl PartialOrd for OrderedQueueKey {
 
 impl Ord for OrderedQueueKey {
     fn cmp(&self, other: &OrderedQueueKey) -> Ordering {
-        match self.gas_price.cmp(&other.gas_price) {
+        match self.gas_ranking_score.cmp(&other.gas_ranking_score) {
             Ordering::Equal => {}
             ordering => return ordering,
         }
@@ -210,6 +214,22 @@ impl TimelineIndex {
         batch
     }
 
+    /// read all transactions from timeline for timeline id in range (`start_timeline_id`, `end_timeline_id`]
+    pub(crate) fn range(
+        &mut self,
+        start_timeline_id: u64,
+        end_timeline_id: u64,
+    ) -> Vec<(AccountAddress, u64)> {
+        let mut batch = vec![];
+        for (_, &(address, sequence_number)) in self.timeline.range((
+            Bound::Excluded(start_timeline_id),
+            Bound::Included(end_timeline_id),
+        )) {
+            batch.push((address, sequence_number));
+        }
+        batch
+    }
+
     /// add transaction to index
     pub(crate) fn insert(&mut self, txn: &mut MempoolTransaction) {
         self.timeline.insert(
@@ -256,6 +276,10 @@ impl ParkingLotIndex {
     /// returns random "non-ready" transaction (with highest sequence number for that account)
     pub(crate) fn pop(&mut self) -> Option<TxnPointer> {
         self.data.iter().rev().next().cloned()
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        self.data.len()
     }
 }
 

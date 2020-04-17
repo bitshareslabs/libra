@@ -1,71 +1,73 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use config::config::NodeConfig;
-use failure::prelude::*;
-use network::validator_network::{ConsensusNetworkEvents, ConsensusNetworkSender};
+use crate::{
+    chained_bft::{
+        epoch_manager::EpochManager,
+        network::NetworkTask,
+        network_interface::{ConsensusNetworkEvents, ConsensusNetworkSender},
+        persistent_liveness_storage::StorageWriteProxy,
+    },
+    counters,
+    state_computer::ExecutionProxy,
+    txn_manager::MempoolProxy,
+    util::time_service::ClockTimeService,
+};
+use channel::libra_channel;
+use executor::Executor;
+use futures::channel::mpsc;
+use libra_config::config::NodeConfig;
+use libra_logger::prelude::*;
+use libra_mempool::ConsensusRequest;
+use libra_types::{on_chain_config::OnChainConfigPayload, transaction::SignedTransaction};
+use libra_vm::LibraVM;
+use state_synchronizer::StateSyncClient;
+use std::sync::{Arc, Mutex};
+use storage_interface::DbReader;
+use tokio::runtime::{self, Runtime};
 
-use crate::chained_bft::chained_bft_consensus_provider::ChainedBftProvider;
-use execution_proto::proto::execution_grpc::ExecutionClient;
-use grpcio::{ChannelBuilder, EnvBuilder};
-use mempool::proto::mempool_grpc::MempoolClient;
-use std::sync::Arc;
-use storage_client::{StorageRead, StorageReadServiceClient};
+/// Helper function to start consensus based on configuration and return the runtime
+pub fn start_consensus(
+    node_config: &mut NodeConfig,
+    network_sender: ConsensusNetworkSender<Vec<SignedTransaction>>,
+    network_events: ConsensusNetworkEvents<Vec<SignedTransaction>>,
+    executor: Arc<Mutex<Executor<LibraVM>>>,
+    state_sync_client: Arc<StateSyncClient>,
+    consensus_to_mempool_sender: mpsc::Sender<ConsensusRequest>,
+    libra_db: Arc<dyn DbReader>,
+    reconfig_events: libra_channel::Receiver<(), OnChainConfigPayload>,
+) -> Runtime {
+    let runtime = runtime::Builder::new()
+        .thread_name("consensus-")
+        .threaded_scheduler()
+        .enable_all()
+        .build()
+        .expect("Failed to create Tokio runtime!");
+    let storage = Arc::new(StorageWriteProxy::new(node_config, libra_db));
+    let txn_manager = Box::new(MempoolProxy::new(consensus_to_mempool_sender));
+    let state_computer = Arc::new(ExecutionProxy::new(executor, state_sync_client));
+    let time_service = Arc::new(ClockTimeService::new(runtime.handle().clone()));
 
-/// Public interface to a consensus protocol.
-pub trait ConsensusProvider {
-    /// Spawns new threads, starts the consensus operations (retrieve txns, consensus protocol,
-    /// execute txns, commit txns, update txn status in the mempool, etc).
-    /// The function returns after consensus has recovered its initial state,
-    /// and has established the required connections (e.g., to mempool and
-    /// executor).
-    fn start(&mut self) -> Result<()>;
+    let (timeout_sender, timeout_receiver) =
+        channel::new(1_024, &counters::PENDING_PACEMAKER_TIMEOUTS);
+    let (self_sender, self_receiver) = channel::new(1_024, &counters::PENDING_SELF_MESSAGES);
 
-    /// Stop the consensus operations. The function returns after graceful shutdown.
-    fn stop(&mut self);
-}
-
-/// Helper function to create a ConsensusProvider based on configuration
-pub fn make_consensus_provider(
-    node_config: &NodeConfig,
-    network_sender: ConsensusNetworkSender,
-    network_receiver: ConsensusNetworkEvents,
-) -> Box<dyn ConsensusProvider> {
-    Box::new(ChainedBftProvider::new(
+    let epoch_mgr = EpochManager::new(
         node_config,
+        time_service,
+        self_sender,
         network_sender,
-        network_receiver,
-        create_mempool_client(node_config),
-        create_execution_client(node_config),
-    ))
-}
-/// Create a mempool client assuming the mempool is running on localhost
-fn create_mempool_client(config: &NodeConfig) -> Arc<MempoolClient> {
-    let port = config.mempool.mempool_service_port;
-    let connection_str = format!("localhost:{}", port);
+        timeout_sender,
+        txn_manager,
+        state_computer,
+        storage,
+    );
 
-    let env = Arc::new(EnvBuilder::new().name_prefix("grpc-con-mem-").build());
-    Arc::new(MempoolClient::new(
-        ChannelBuilder::new(env).connect(&connection_str),
-    ))
-}
+    let (network_task, network_receiver) = NetworkTask::new(network_events, self_receiver);
 
-/// Create an execution client assuming the mempool is running on localhost
-fn create_execution_client(config: &NodeConfig) -> Arc<ExecutionClient> {
-    let connection_str = format!("localhost:{}", config.execution.port);
+    runtime.spawn(network_task.start());
+    runtime.spawn(epoch_mgr.start(timeout_receiver, network_receiver, reconfig_events));
 
-    let env = Arc::new(EnvBuilder::new().name_prefix("grpc-con-exe-").build());
-    Arc::new(ExecutionClient::new(
-        ChannelBuilder::new(env).connect(&connection_str),
-    ))
-}
-
-/// Create a storage read client based on the config
-pub fn create_storage_read_client(config: &NodeConfig) -> Arc<dyn StorageRead> {
-    let env = Arc::new(EnvBuilder::new().name_prefix("grpc-con-sto-").build());
-    Arc::new(StorageReadServiceClient::new(
-        env,
-        &config.storage.address,
-        config.storage.port,
-    ))
+    debug!("Consensus started.");
+    runtime
 }
